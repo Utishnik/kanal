@@ -83,6 +83,25 @@ std::thread::spawn(move || {
 });
 ```
 
+### Async runtime integration
+
+The async API never blocks the executor thread: when a channel operation has
+to wait, it first yields to the runtime and then sleeps through an async timer.
+By default a small runtime-agnostic timer is used. To use the native timer of
+your executor instead, enable exactly one of the following features:
+
+```toml
+[dependencies]
+# pick one
+kanal = { version = "0.1", features = ["async-tokio"] }
+# kanal = { version = "0.1", features = ["async-smol"] }
+# kanal = { version = "0.1", features = ["async-compio"] }
+```
+
+If no runtime feature is enabled, or several are enabled at once (for example
+with `--all-features`), Kanal falls back to the runtime-agnostic timer so the
+futures keep working under any executor and remain `Send`.
+
 ## Why use Kanal?
 
 - Kanal offers fast and efficient communication capabilities.

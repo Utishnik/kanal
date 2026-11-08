@@ -1,6 +1,8 @@
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs, missing_debug_implementations)]
 
+#[cfg(feature = "async")]
+pub(crate) mod async_backoff;
 pub(crate) mod backoff;
 pub(crate) mod internal;
 // The custom mutex is compiled under loom regardless of the std-mutex

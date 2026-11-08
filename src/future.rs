@@ -6,7 +6,10 @@ use branches::unlikely;
 use futures_core::{FusedStream, Future, Stream};
 
 use crate::{
-    internal::{acquire_internal, Internal},
+    async_backoff::AsyncWait,
+    internal::{
+        acquire_internal, poll_acquire_internal, try_acquire_internal, Internal,
+    },
     signal::{AsyncSignal, DeferredNotify},
     AsyncReceiver, ReceiveError, SendError,
 };
@@ -58,6 +61,7 @@ impl FutureState {
 pub struct SendFuture<'a, T> {
     internal: &'a Internal<T>,
     sig: AsyncSignal<T>,
+    wait: AsyncWait,
     _pinned: PhantomPinned,
 }
 
@@ -103,6 +107,7 @@ impl<'a, T> SendFuture<'a, T> {
         SendFuture {
             internal,
             sig: AsyncSignal::new_send(data),
+            wait: AsyncWait::new(),
             _pinned: PhantomPinned,
         }
     }
@@ -111,6 +116,7 @@ impl<'a, T> SendFuture<'a, T> {
         SendFuture {
             internal,
             sig: AsyncSignal::new_send_finished(),
+            wait: AsyncWait::new(),
             _pinned: PhantomPinned,
         }
     }
@@ -129,7 +135,14 @@ impl<T> Future for SendFuture<'_, T> {
         match this.sig.state() {
             FutureState::Unregistered => {
                 let cap = this.internal.capacity();
-                let mut internal = acquire_internal(this.internal);
+                let mut internal = match poll_acquire_internal(
+                    this.internal,
+                    &mut this.wait,
+                    cx,
+                ) {
+                    Poll::Ready(internal) => internal,
+                    Poll::Pending => return Poll::Pending,
+                };
                 if unlikely(internal.recv_count == 0) {
                     drop(internal);
                     this.sig.set_state_relaxed(FutureState::Done);
@@ -177,7 +190,14 @@ impl<T> Future for SendFuture<'_, T> {
                 if unlikely(unsafe { !this.sig.will_wake(waker) }) {
                     // Waker is changed and we need to update waker in the
                     // waiting list
-                    let internal = acquire_internal(this.internal);
+                    let internal = match poll_acquire_internal(
+                        this.internal,
+                        &mut this.wait,
+                        cx,
+                    ) {
+                        Poll::Ready(internal) => internal,
+                        Poll::Pending => return Poll::Pending,
+                    };
                     if internal.send_signal_exists(this.sig.as_tagged_ptr()) {
                         // SAFETY: signal is not shared with other thread yet so
                         // it's safe to update waker
@@ -199,7 +219,11 @@ impl<T> Future for SendFuture<'_, T> {
                     // make blocking_wait return false immediately and report a
                     // spurious error (and reclaim data that
                     // was in fact delivered).
-                    let delivered = this.sig.blocking_wait();
+                    let delivered = match this.sig.poll_wait(&mut this.wait, cx)
+                    {
+                        Poll::Ready(delivered) => delivered,
+                        Poll::Pending => return Poll::Pending,
+                    };
                     this.sig.set_state_relaxed(FutureState::Done);
                     if delivered {
                         return Poll::Ready(Ok(()));
@@ -234,6 +258,7 @@ pub struct ReceiveFuture<'a, T> {
     is_stream: bool,
     internal: &'a Internal<T>,
     sig: AsyncSignal<T>,
+    wait: AsyncWait,
     _pinned: PhantomPinned,
 }
 
@@ -294,6 +319,7 @@ impl<'a, T> ReceiveFuture<'a, T> {
             sig: AsyncSignal::new_recv(),
             internal,
             is_stream: false,
+            wait: AsyncWait::new(),
             _pinned: PhantomPinned,
         }
     }
@@ -313,7 +339,14 @@ impl<T> Future for ReceiveFuture<'_, T> {
             return match this.sig.state() {
                 FutureState::Unregistered => {
                     let cap = this.internal.capacity();
-                    let mut internal = acquire_internal(this.internal);
+                    let mut internal = match poll_acquire_internal(
+                        this.internal,
+                        &mut this.wait,
+                        cx,
+                    ) {
+                        Poll::Ready(internal) => internal,
+                        Poll::Pending => return Poll::Pending,
+                    };
                     if unlikely(internal.recv_count == 0) {
                         drop(internal);
                         this.sig.set_state_relaxed(FutureState::Done);
@@ -371,7 +404,14 @@ impl<T> Future for ReceiveFuture<'_, T> {
                     if unsafe { !this.sig.will_wake(waker) } {
                         // the Waker is changed and we need to update waker in
                         // the waiting list
-                        let internal = acquire_internal(this.internal);
+                        let internal = match poll_acquire_internal(
+                            this.internal,
+                            &mut this.wait,
+                            cx,
+                        ) {
+                            Poll::Ready(internal) => internal,
+                            Poll::Pending => return Poll::Pending,
+                        };
                         if internal.recv_signal_exists(this.sig.as_tagged_ptr())
                         {
                             // SAFETY: signal is not shared with other thread
@@ -395,7 +435,11 @@ impl<T> Future for ReceiveFuture<'_, T> {
                             // LOCKED_STARVATION, which would make blocking_wait
                             // return
                             // false immediately and report a spurious error.
-                            let delivered = this.sig.blocking_wait();
+                            let delivered =
+                                match this.sig.poll_wait(&mut this.wait, cx) {
+                                    Poll::Ready(delivered) => delivered,
+                                    Poll::Pending => return Poll::Pending,
+                                };
                             this.sig.set_state_relaxed(FutureState::Done);
                             if delivered {
                                 // SAFETY: the sender wrote the data, it is safe
@@ -495,6 +539,7 @@ pub struct DrainIntoFuture<'a, 'b, T> {
     internal: &'a Internal<T>,
     sig: AsyncSignal<T>,
     vec: &'b mut Vec<T>,
+    wait: AsyncWait,
     _pinned: PhantomPinned,
 }
 
@@ -514,6 +559,7 @@ impl<'a, 'b, T> DrainIntoFuture<'a, 'b, T> {
             internal,
             sig: AsyncSignal::new_recv(),
             vec,
+            wait: AsyncWait::new(),
             _pinned: PhantomPinned,
         }
     }
@@ -521,9 +567,16 @@ impl<'a, 'b, T> DrainIntoFuture<'a, 'b, T> {
     /// Drains the queue and the waiting senders into the vector, completing
     /// the detached senders after releasing the channel lock, and returns
     /// how many messages were appended.
+    ///
+    /// This is called opportunistically from the middle of `poll`, after a
+    /// message has already been delivered. It must not block the executor, so
+    /// when the channel lock is contended it simply skips the extra batch; the
+    /// message that woke the future has already been accounted for.
     #[inline(always)]
     fn drain_available(&mut self) -> usize {
-        let mut internal = acquire_internal(self.internal);
+        let Some(mut internal) = try_acquire_internal(self.internal) else {
+            return 0;
+        };
         let senders = internal.take_sends();
         let available = internal.queue.len() + senders.len();
         self.vec.reserve(available);
@@ -573,7 +626,14 @@ impl<T> Future for DrainIntoFuture<'_, '_, T> {
 
         match this.sig.state() {
             FutureState::Unregistered => {
-                let mut internal = acquire_internal(this.internal);
+                let mut internal = match poll_acquire_internal(
+                    this.internal,
+                    &mut this.wait,
+                    cx,
+                ) {
+                    Poll::Ready(internal) => internal,
+                    Poll::Pending => return Poll::Pending,
+                };
                 if unlikely(internal.recv_count == 0) {
                     drop(internal);
                     this.sig.set_state_relaxed(FutureState::Done);
@@ -631,7 +691,14 @@ impl<T> Future for DrainIntoFuture<'_, '_, T> {
                 if unsafe { !this.sig.will_wake(waker) } {
                     // the Waker is changed and we need to update waker in
                     // the waiting list
-                    let internal = acquire_internal(this.internal);
+                    let internal = match poll_acquire_internal(
+                        this.internal,
+                        &mut this.wait,
+                        cx,
+                    ) {
+                        Poll::Ready(internal) => internal,
+                        Poll::Pending => return Poll::Pending,
+                    };
                     if internal.recv_signal_exists(this.sig.as_tagged_ptr()) {
                         // SAFETY: signal is not shared with other thread
                         // yet so it's safe to update waker locally
@@ -649,7 +716,11 @@ impl<T> Future for DrainIntoFuture<'_, '_, T> {
                         // waiting: Done is greater than LOCKED_STARVATION,
                         // which would make blocking_wait return false
                         // immediately and report a spurious error.
-                        let delivered = this.sig.blocking_wait();
+                        let delivered =
+                            match this.sig.poll_wait(&mut this.wait, cx) {
+                                Poll::Ready(delivered) => delivered,
+                                Poll::Pending => return Poll::Pending,
+                            };
                         if delivered {
                             // SAFETY: the sender wrote the data, it is safe
                             // to read
@@ -697,6 +768,7 @@ pub struct SendManyFuture<'a, 'b, T> {
     finished: bool,
     // If set we are in wait queue and fut shall not be used as mutable
     in_wait_queue: bool,
+    wait: AsyncWait,
     _pinned: PhantomPinned,
 }
 
@@ -712,6 +784,7 @@ impl<'a, 'b, T> SendManyFuture<'a, 'b, T> {
             elements,
             finished: false,
             in_wait_queue: false,
+            wait: AsyncWait::new(),
             _pinned: PhantomPinned,
         }
     }
@@ -759,7 +832,14 @@ impl<'a, 'b, T> Future for SendManyFuture<'a, 'b, T> {
             let cap = this.internal.capacity();
 
             // Acquire a mutable reference to the internal state.
-            let mut internal = acquire_internal(this.internal);
+            let mut internal = match poll_acquire_internal(
+                this.internal,
+                &mut this.wait,
+                cx,
+            ) {
+                Poll::Ready(internal) => internal,
+                Poll::Pending => return Poll::Pending,
+            };
 
             // Channel is closed from the other side
             if unlikely(internal.recv_count == 0) {
@@ -819,6 +899,7 @@ impl<'a, 'b, T> Future for SendManyFuture<'a, 'b, T> {
                 // we are not registered in the queue yet.
                 unsafe {
                     this.fut.get_mut().sig.reset_send(v);
+                    this.fut.get_mut().wait.reset();
                     // Register the waker before sharing the signal, so the
                     // wakeup cannot be lost and the poll of the inner future
                     // below does not have to re-lock the channel to fix a

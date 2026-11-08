@@ -2,7 +2,11 @@ use core::mem::ManuallyDrop;
 #[cfg(not(loom))]
 use core::time::Duration;
 #[cfg(feature = "async")]
-use core::{fmt::Debug, mem::MaybeUninit, task::Waker};
+use core::{
+    fmt::Debug,
+    mem::MaybeUninit,
+    task::{Context, Poll, Waker},
+};
 use std::time::Instant;
 
 #[cfg(not(loom))]
@@ -10,6 +14,8 @@ use branches::likely;
 use branches::unlikely;
 use cacheguard::CacheGuard;
 
+#[cfg(feature = "async")]
+use crate::async_backoff::AsyncWait;
 #[cfg(not(loom))]
 use crate::backoff;
 #[cfg(not(loom))]
@@ -568,6 +574,46 @@ impl<T> AsyncSignal<T> {
         self.data.with_mut(|d| unsafe {
             (*d).as_mut_ptr().drop_in_place();
         });
+    }
+    /// Async counterpart of [`Self::blocking_wait`], used from the futures'
+    /// `poll` implementations.
+    ///
+    /// Instead of yielding/sleeping the executor thread, it hands control back
+    /// to the runtime through `wait`. The caller returns [`Poll::Pending`]
+    /// while waiting, so a contended channel never blocks the runtime worker.
+    ///
+    /// The signal's stored waker is the one the counterpart will wake. When
+    /// this helper is used the caller may have been unable to refresh that
+    /// waker (the signal was already popped from the waitlist), so `wait` also
+    /// arms a timer: even a lost wakeup eventually leads to a re-poll and the
+    /// operation completes by observing the atomic signal state.
+    #[cfg(feature = "async")]
+    #[inline]
+    pub(crate) fn poll_wait(
+        &self,
+        wait: &mut AsyncWait,
+        cx: &mut Context<'_>,
+    ) -> Poll<bool> {
+        #[cfg(loom)]
+        {
+            let _ = (wait, cx);
+            Poll::Ready(self.blocking_wait())
+        }
+        #[cfg(not(loom))]
+        {
+            loop {
+                let v = self.state.load(Ordering::Relaxed);
+                if likely(v > LOCKED_STARVATION) {
+                    fence(Ordering::Acquire);
+                    wait.reset();
+                    return Poll::Ready(v == UNLOCKED);
+                }
+                match wait.poll(cx) {
+                    Poll::Ready(()) => {}
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        }
     }
     #[cfg(not(loom))]
     #[inline(never)]

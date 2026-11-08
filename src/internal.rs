@@ -7,8 +7,14 @@ use core::fmt::Debug;
 #[cfg(all(feature = "std-mutex", not(loom)))]
 use std::sync::{Mutex, MutexGuard};
 
+#[cfg(feature = "async")]
+use core::task::{Context, Poll};
+
 use branches::unlikely;
 use cacheguard::CacheGuard;
+
+#[cfg(feature = "async")]
+use crate::async_backoff::AsyncWait;
 // Loom's model-checked mutex replaces both mutex flavors under `--cfg
 // loom`; the kanal RawMutexLock itself is model-checked separately in
 // src/mutex.rs.
@@ -155,8 +161,60 @@ pub(crate) fn try_acquire_internal<T>(
 ) -> Option<MutexGuard<'_, ChannelInternal<T>>> {
     #[cfg(all(not(feature = "std-mutex"), not(loom)))]
     return internal.try_lock();
-    #[cfg(any(feature = "std-mutex", loom))]
+    // Mirror `acquire_internal`'s poison recovery: a poisoned std mutex must
+    // still be usable, otherwise the async acquisition loop would retry
+    // forever.
+    #[cfg(all(feature = "std-mutex", not(loom)))]
+    return match internal.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(err)) => Some(err.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    };
+    #[cfg(loom)]
     internal.try_lock().ok()
+}
+
+/// Acquires the channel internal lock without blocking the executor thread.
+///
+/// This is the async counterpart of [`acquire_internal`]: when the lock is
+/// contended it drives `wait` (runtime yields followed by a runtime timer)
+/// and returns [`Poll::Pending`] so the task is rescheduled instead of
+/// parking the runtime worker.
+///
+/// Under loom the helper stays blocking on loom's cooperative yield: loom
+/// does not model async wakeups and its futures are polled to completion on a
+/// single thread, so yielding inside the poll is the modeled equivalent.
+#[cfg(feature = "async")]
+#[inline(always)]
+pub(crate) fn poll_acquire_internal<'a, T>(
+    internal: &'a Internal<T>,
+    wait: &mut AsyncWait,
+    cx: &mut Context<'_>,
+) -> Poll<MutexGuard<'a, ChannelInternal<T>>> {
+    #[cfg(loom)]
+    {
+        let _ = (wait, cx);
+        loop {
+            if let Some(guard) = try_acquire_internal(internal) {
+                return Poll::Ready(guard);
+            }
+            crate::primitives::yield_now();
+        }
+    }
+
+    #[cfg(not(loom))]
+    {
+        loop {
+            if let Some(guard) = try_acquire_internal(internal) {
+                wait.reset();
+                return Poll::Ready(guard);
+            }
+            match wait.poll(cx) {
+                Poll::Ready(()) => {}
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
 }
 
 /// Internal of the channel that holds queues, waitlists, and general state of
@@ -403,5 +461,67 @@ impl<T> ChannelInternal<T> {
         }
         self.ref_count -= 1;
         (self.ref_count == 0, cleanup)
+    }
+}
+
+#[cfg(all(test, feature = "async", not(feature = "std-mutex"), not(loom)))]
+mod async_acquire_tests {
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        task::{Context, Poll, Wake, Waker},
+    };
+
+    use super::{acquire_internal, poll_acquire_internal, Internal};
+    use crate::async_backoff::AsyncWait;
+
+    /// Waker that counts how many times the task was rescheduled.
+    struct CountingWaker(AtomicUsize);
+
+    impl Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A contended async acquisition must hand control back to the runtime
+    /// (return `Pending` and wake the task) instead of spinning/sleeping on
+    /// the executor thread.
+    #[test]
+    fn contended_lock_yields_instead_of_blocking() {
+        let internal = Internal::<u8>::new(false, 0);
+        // Hold the channel lock so the async acquisition has to back off.
+        let guard = acquire_internal(&internal);
+
+        let state = Arc::new(CountingWaker(AtomicUsize::new(0)));
+        let waker = Waker::from(state.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut wait = AsyncWait::new();
+
+        match poll_acquire_internal(&internal, &mut wait, &mut cx) {
+            Poll::Pending => {}
+            Poll::Ready(_) => {
+                panic!("lock unexpectedly acquired while it was held")
+            }
+        }
+        // The yield phase reschedules the task instead of parking the thread.
+        assert!(state.0.load(Ordering::SeqCst) >= 1);
+
+        drop(guard);
+
+        // Once the lock is free the very next poll acquires it.
+        match poll_acquire_internal(&internal, &mut wait, &mut cx) {
+            Poll::Ready(guard) => drop(guard),
+            Poll::Pending => panic!("lock was not acquired after release"),
+        }
+
+        // SAFETY: the channel is not shared and no operation is in flight.
+        unsafe { internal.drop() };
     }
 }

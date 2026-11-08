@@ -17,15 +17,31 @@ cacheguard = "0.1"
 futures-core = { version = "0.3", optional = true }
 lock_api = "0.4"
 
+# Runtime timers and runtime crates are only needed by real (non-loom) builds.
+# Keeping them out of the loom dependency graph also keeps the global
+# `RUSTFLAGS="--cfg loom"` from leaking into third-party crates that contain
+# their own `cfg(loom)` code.
+[target.'cfg(not(loom))'.dependencies]
+# Runtime-agnostic async timer used when no (or more than one) runtime
+# backend feature is selected. See src/async_backoff.rs.
+futures-timer = { version = "3", optional = true }
+# Exactly one of these is picked up by `async-tokio`, `async-smol` and
+# `async-compio` to sleep through the native runtime timer.
+compio = { version = "0.19", optional = true, default-features = false, features = ["runtime", "time", "polling"] }
+smol = { version = "2", optional = true }
+tokio = { version = "1", optional = true, default-features = false, features = ["rt", "time"] }
+
 [dev-dependencies]
 anyhow = "1.0"
+criterion = "0.8"
+crossbeam = "0.8"
+futures = "0.3"
+
+[target.'cfg(not(loom))'.dev-dependencies]
 # `polling` lets the Linux fusion driver fall back to poll when io_uring is
 # unavailable (for example inside restricted CI containers).
 compio = { version = "0.19", features = ["macros", "time", "polling"] }
-criterion = "0.8"
-crossbeam = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "test-util", "macros"] }
-futures = "0.3"
 
 # Model checker for concurrent code, active only with RUSTFLAGS="--cfg loom".
 # See tests/loom.rs for how to run the loom test suite.
@@ -36,7 +52,13 @@ loom = { version = "0.7", features = ["futures"] }
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
 
 [features]
-async = ["futures-core"]
+async = ["futures-core", "dep:futures-timer"]
+# Native async timers used by the async backoff. Enable at most one; if none
+# or several are enabled, the runtime-agnostic `futures-timer` fallback is
+# used instead.
+async-tokio = ["async", "dep:tokio"]
+async-smol = ["async", "dep:smol"]
+async-compio = ["async", "dep:compio"]
 std-mutex = []
 default = ["async"]
 
