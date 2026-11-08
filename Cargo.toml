@@ -19,6 +19,9 @@ lock_api = "0.4"
 
 [dev-dependencies]
 anyhow = "1.0"
+# `polling` lets the Linux fusion driver fall back to poll when io_uring is
+# unavailable (for example inside restricted CI containers).
+compio = { version = "0.19", features = ["macros", "time", "polling"] }
 criterion = "0.8"
 crossbeam = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "test-util", "macros"] }
