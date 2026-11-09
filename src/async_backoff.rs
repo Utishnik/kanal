@@ -163,7 +163,20 @@ fn sleep_future(dur: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         not(feature = "async-smol"),
         feature = "async-compio"
     ))]
-    return Box::pin(compio_sleep(dur));
+    return Box::pin(async move {
+        // compio's `TimerFuture` borrows runtime state through an `Rc`, so it
+        // is `!Send`, while the channel futures must stay `Send`. compio
+        // solves this itself with its `SendWrapper` (which the driver and
+        // executor use for the same reason), so the native
+        // `compio::time::sleep` is stored directly inside the channel future.
+        //
+        // The wrapper matches compio's thread-per-core affinity rules: the
+        // timer is armed, polled and dropped on the runtime thread that polls
+        // the channel future, like any other compio timer.
+        let timer =
+            compio_send_wrapper::SendWrapper::new(compio::time::sleep(dur));
+        timer.await;
+    });
 
     // No backend, or an ambiguous combination (e.g. `--all-features`): fall
     // back to the runtime agnostic timer so the future stays `Send` and works
@@ -186,26 +199,6 @@ fn sleep_future(dur: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         )
     )))]
     return Box::pin(futures_timer::Delay::new(dur));
-}
-
-/// Compio's `TimerFuture` borrows runtime state through an `Rc` and is
-/// therefore `!Send`, while the channel futures must stay `Send`. Drive the
-/// timer on a detached compio task and await its `JoinHandle` (which is `Send`
-/// for a `()` output) from the channel future.
-#[cfg(all(
-    not(loom),
-    feature = "async-compio",
-    not(feature = "async-tokio"),
-    not(feature = "async-smol")
-))]
-#[inline]
-async fn compio_sleep(dur: Duration) {
-    let task = compio::runtime::spawn(async move {
-        compio::time::sleep(dur).await;
-    });
-    // A cancelled task only means the runtime is shutting down; the caller
-    // will observe the channel's own state and time out or retry anyway.
-    let _ = task.await;
 }
 
 // Exercise the runtime agnostic fallback timer whenever it is the selected

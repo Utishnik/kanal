@@ -28,6 +28,11 @@ futures-timer = { version = "3", optional = true }
 # Exactly one of these is picked up by `async-tokio`, `async-smol` and
 # `async-compio` to sleep through the native runtime timer.
 compio = { version = "0.19", optional = true, default-features = false, features = ["runtime", "time", "polling"] }
+# Makes `compio`'s thread-affine `TimerFuture` storable inside the `Send`
+# async futures (see src/async_backoff.rs).
+compio-send-wrapper = { version = "0.7", optional = true, features = [
+    "futures",
+] }
 smol = { version = "2", optional = true }
 tokio = { version = "1", optional = true, default-features = false, features = ["rt", "time"] }
 
@@ -58,7 +63,7 @@ async = ["futures-core", "dep:futures-timer"]
 # used instead.
 async-tokio = ["async", "dep:tokio"]
 async-smol = ["async", "dep:smol"]
-async-compio = ["async", "dep:compio"]
+async-compio = ["async", "dep:compio", "dep:compio-send-wrapper"]
 std-mutex = []
 default = ["async"]
 

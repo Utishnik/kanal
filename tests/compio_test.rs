@@ -2,7 +2,24 @@
 // the same async channel behaviour on a different runtime. Not compiled under
 // loom (the loom models live in tests/loom.rs) or miri (compio talks to IOCP /
 // io_uring, which miri cannot emulate).
-#![cfg(all(not(loom), not(miri)))]
+//
+// The compio executor must only be polled by futures whose timer selection
+// matches it: the multi-feature setup (`--all-features` or any combination
+// that includes `async-compio`) uses the runtime agnostic `futures-timer`
+// fallback everywhere, and a single enabled backend is only safe here when it
+// is `async-compio`. Exactly one of `async-tokio`/`async-smol` selected
+// without `async-compio` would arm that runtime's timer inside this suite's
+// polls (tokio's timer requires a tokio context), so those runs skip this
+// suite.
+#![cfg(all(
+    not(loom),
+    not(miri),
+    any(
+        feature = "async-compio",
+        all(not(feature = "async-tokio"), not(feature = "async-smol")),
+        all(feature = "async-tokio", feature = "async-smol"),
+    ),
+))]
 
 #[cfg(feature = "async")]
 mod utils;

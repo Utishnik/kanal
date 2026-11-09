@@ -1,6 +1,22 @@
 // Not compiled under loom: these tests use real threads, real time and
 // tokio; the loom models live in tests/loom.rs.
-#![cfg(not(loom))]
+//
+// The tokio executor must only be polled by futures whose timer selection
+// matches it: the `--all-features`/multi-feature setup uses the runtime
+// agnostic `futures-timer` fallback everywhere, and a single enabled backend
+// is only safe here when it is `async-tokio`. Picking exactly one of
+// `async-smol`/`async-compio` would arm that runtime's timer inside this
+// suite's polls (for example compio panics with "not in a compio runtime" on
+// tokio worker threads), so those runs skip this suite; the smol and compio
+// suites cover their own backends.
+#![cfg(all(
+    not(loom),
+    any(
+        feature = "async-tokio",
+        all(not(feature = "async-smol"), not(feature = "async-compio")),
+        all(feature = "async-smol", feature = "async-compio"),
+    ),
+))]
 
 #[cfg(feature = "async")]
 mod utils;

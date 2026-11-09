@@ -2,8 +2,11 @@
 //!
 //! These mirror the most important parts of `tests/async_test.rs` and exercise
 //! the `async-smol` timer backend of the async backoff. They are only compiled
-//! when the `async-smol` feature is enabled (the tokio and compio suites cover
-//! the other backends).
+//! when the `async-smol` feature is enabled (needed for `smol` itself), which
+//! also guarantees a compatible timer selection for the smol executor: with
+//! `async-smol` on, the timer is either smol's own or the runtime agnostic
+//! `futures-timer` fallback (multi-feature setups), never tokio's or compio's
+//! (a runtime that the smol executor has no access to).
 #![cfg(all(not(loom), feature = "async-smol"))]
 
 use std::collections::VecDeque;
